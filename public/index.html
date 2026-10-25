@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<title>سباق الخطوط</title>
+<style>
+  * { box-sizing: border-box; margin: 0; }
+  html, body { height: 100%; }
+  body {
+    font-family: system-ui, -apple-system, "Segoe UI", Tahoma, sans-serif;
+    background: #eef1f7; display: flex; flex-direction: column;
+    touch-action: none; user-select: none; -webkit-user-select: none;
+    padding: env(safe-area-inset-top) 0 env(safe-area-inset-bottom);
+  }
+  .hidden { display: none !important; }
+  #lobby { flex: 1; display: flex; flex-direction: column; gap: 12px; justify-content: center; padding: 20px; max-width: 380px; width: 100%; margin: auto; }
+  h2 { text-align: center; margin-bottom: 8px; }
+  input { padding: 12px; font-size: 16px; border: 1px solid #ccd; border-radius: 10px; text-align: center; }
+  button { padding: 12px 16px; font-size: 16px; border: 0; border-radius: 10px; background: #3b6cf6; color: #fff; font-weight: 600; }
+  button:disabled { opacity: .45; }
+  .or { text-align: center; color: #667; font-size: 14px; }
+  #err { color: #d33; font-size: 14px; min-height: 18px; text-align: center; }
+  #game { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+  #hud { display: flex; justify-content: space-between; align-items: center; padding: 8px 14px; gap: 8px; }
+  #score { font-size: 22px; font-weight: 800; }
+  #status { flex: 1; text-align: center; font-size: 15px; font-weight: 600; }
+  #timer { font-size: 18px; font-weight: 700; min-width: 40px; text-align: left; }
+  #board { flex: 1; position: relative; min-height: 0; }
+  canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+  #bottom { padding: 10px 14px; display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+  #meta { font-size: 14px; color: #556; }
+  #ready { min-width: 150px; }
+</style>
+</head>
+<body>
+
+<div id="lobby">
+  <h2>سباق الخطوط 🏁</h2>
+  <input id="name" placeholder="اسمك" maxlength="15">
+  <button id="create">اعمل أوضة جديدة</button>
+  <div class="or">أو</div>
+  <input id="code" placeholder="كود الأوضة" maxlength="4">
+  <button id="join">ادخل الأوضة</button>
+  <div id="err"></div>
+</div>
+
+<div id="game" class="hidden">
+  <div id="hud">
+    <div id="score">0 - 0</div>
+    <div id="status"></div>
+    <div id="timer"></div>
+  </div>
+  <div id="board"><canvas id="c"></canvas></div>
+  <div id="bottom">
+    <div id="meta"></div>
+    <button id="ready">جاهز</button>
+  </div>
+</div>
+
+<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+<script>
+// Put your Render server URL here after deploying it
+const SERVER_URL = 'https://YOUR-SERVICE.onrender.com';
+
+const W = 360, H = 640, R = 9, FINISH_Y = 40;
+const START = { red: { x: 90, y: H - 30 }, blue: { x: 270, y: H - 30 } };
+const COLOR = { red: '#e5484d', blue: '#3b6cf6' };
+
+const socket = io(SERVER_URL);
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+const $ = (id) => document.getElementById(id);
+
+let me = null;          // { color, code }
+let state = null;       // latest server state
+let lines = { red: [], blue: [] };
+let round = -1;
+let balls = null;
+let view = { s: 1, ox: 0, oy: 0 };
+let drawing = false, last = null;
+
+// ---------- Lobby ----------
+function handle(res) {
+  if (res.error) { $('err').textContent = res.error; return; }
+  me = { color: res.color, code: res.code };
+  $('lobby').classList.add('hidden');
+  $('game').classList.remove('hidden');
+  resize();
+}
+$('create').onclick = () => socket.emit('create', { name: $('name').value.trim() }, handle);
+$('join').onclick = () => socket.emit('join', { code: $('code').value, name: $('name').value.trim() }, handle);
+
+// ---------- Canvas sizing and coordinates ----------
+function resize() {
+  const r = cv.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  cv.width = r.width * dpr;
+  cv.height = r.height * dpr;
+  const s = Math.min(r.width / W, r.height / H);
+  view = { s, ox: (r.width - W * s) / 2, oy: (r.height - H * s) / 2 };
+  draw();
+}
+window.addEventListener('resize', resize);
+
+function toBoard(e) {
+  const r = cv.getBoundingClientRect();
+  return {
+    x: Math.max(0, Math.min(W, (e.clientX - r.left - view.ox) / view.s)),
+    y: Math.max(0, Math.min(H, (e.clientY - r.top - view.oy) / view.s)),
+  };
+}
+
+// ---------- Drawing with finger/mouse ----------
+cv.addEventListener('pointerdown', (e) => {
+  if (!state || !me || state.phase !== 'draw') return;
+  cv.setPointerCapture(e.pointerId);
+  drawing = true;
+  last = toBoard(e);
+});
+cv.addEventListener('pointermove', (e) => {
+  if (!drawing) return;
+  const p = toBoard(e);
+  const d = Math.hypot(p.x - last.x, p.y - last.y);
+  if (d < 4 || d > state.ink[me.color]) return;   // sample points, respect ink
+  socket.emit('seg', { x1: last.x, y1: last.y, x2: p.x, y2: p.y });
+  last = p;
+});
+const stopDraw = () => { drawing = false; last = null; };
+cv.addEventListener('pointerup', stopDraw);
+cv.addEventListener('pointercancel', stopDraw);
+
+$('ready').onclick = () => socket.emit('ready');
+
+// ---------- Server events ----------
+socket.on('state', (s) => {
+  state = s;
+  if (s.round !== round) { round = s.round; lines = { red: [], blue: [] }; }
+  if (s.phase === 'draw') balls = null;
+  updateUI();
+  draw();
+});
+
+socket.on('seg', (g) => {
+  lines[g.color].push(g);
+  if (state) state.ink[g.color] = g.ink;
+  updateUI();
+  draw();
+});
+
+socket.on('balls', (b) => { balls = b; draw(); });
+
+// ---------- UI ----------
+function updateUI() {
+  if (!state || !me) return;
+  const opp = me.color === 'red' ? 'blue' : 'red';
+  const mine = state.scores[me.color], theirs = state.scores[opp];
+  const p = state.phase;
+  $('score').textContent = `${mine} - ${theirs}`;
+
+  let t = '';
+  if (p === 'waiting') t = 'مستنيين صاحبك يدخل بالكود';
+  else if (p === 'draw') t = 'ارسم خطوط تعطل الخصم وتساعد كورتك';
+  else if (p === 'race') t = 'السباق بدأ!';
+  else if (p === 'roundEnd') t = !state.winner ? 'محدش كسب الجولة' : state.winner === me.color ? 'كسبت الجولة 🎉' : 'خسرت الجولة';
+  else if (p === 'over') t = mine > theirs ? 'مبروك! كسبت المباراة 🏆' : 'خسرت المباراة، جولة تانية؟';
+  $('status').textContent = t;
+
+  $('meta').textContent = `الكود: ${me.code} · الحبر: ${Math.round(state.ink[me.color])}`;
+
+  const rb = $('ready');
+  rb.classList.toggle('hidden', p !== 'draw');
+  rb.disabled = !!state.ready[me.color];
+  rb.textContent = state.ready[me.color] ? 'مستنيين الخصم...' : 'جاهز';
+}
+
+setInterval(() => {
+  if (!state) return;
+  const live = state.phase === 'draw' || state.phase === 'race';
+  $('timer').textContent = live ? Math.ceil(Math.max(0, state.deadline - Date.now()) / 1000) + 's' : '';
+}, 250);
+
+// ---------- Rendering ----------
+function draw() {
+  if (!view.s || !cv.width) return;
+  const dpr = window.devicePixelRatio || 1;
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, cv.width, cv.height);
+  ctx.setTransform(dpr * view.s, 0, 0, dpr * view.s, dpr * view.ox, dpr * view.oy);
+
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(0, 0, W, H);
+  ctx.strokeStyle = '#e6e9f2';
+  ctx.lineWidth = 1;
+  for (let x = 0; x <= W; x += 30) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke(); }
+  for (let y = 0; y <= H; y += 30) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke(); }
+
+  ctx.fillStyle = '#2bb673';
+  ctx.fillRect(0, 0, W, FINISH_Y);
+  ctx.fillStyle = '#fff';
+  ctx.font = 'bold 16px sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText('FINISH', W / 2, FINISH_Y / 2);
+
+  ctx.lineCap = 'round';
+  ctx.lineWidth = 6;
+  for (const c of ['red', 'blue']) {
+    ctx.strokeStyle = COLOR[c];
+    ctx.beginPath();
+    for (const s of lines[c]) { ctx.moveTo(s.x1, s.y1); ctx.lineTo(s.x2, s.y2); }
+    ctx.stroke();
+  }
+
+  if (!balls) {
+    ctx.globalAlpha = 0.3;
+    for (const c of ['red', 'blue']) {
+      ctx.fillStyle = COLOR[c];
+      ctx.beginPath(); ctx.arc(START[c].x, START[c].y, R, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  } else {
+    for (const c of ['red', 'blue']) {
+      const b = balls[c];
+      ctx.fillStyle = COLOR[c];
+      ctx.beginPath(); ctx.arc(b.x, b.y, R, 0, Math.PI * 2); ctx.fill();
+    }
+  }
+}
+</script>
+</body>
+</html>
